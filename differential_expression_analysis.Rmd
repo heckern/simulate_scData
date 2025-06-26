@@ -229,7 +229,8 @@ seurat_obj <- FindVariableFeatures(seurat_obj, selection.method = "vst", nfeatur
 top10 <- head(VariableFeatures(seurat_obj), 10)
 
 # plot variable features with and without labels
-plot <- LabelPoints(plot = plot1, points = top10, repel = TRUE)
+plot <- VariableFeaturePlot(seurat_obj)
+plot <- LabelPoints(plot=plot, points = top10, repel = TRUE)
 plot
 ```
 
@@ -310,23 +311,6 @@ DimPlot(
 We can indeed observe that all samples integrate well despite the differential expression of the 100 genes. This is usually the case for data that was obtained from different samples but similar cell types.
 
 
-
-REMOVE
-```{r}
-list_genes[idx_diff_genes]
-```
-
-```{r}
-list_genes[-idx_diff_genes][0:10]
-```
-REMOVE
-
-
-```{r}
-features <- c("EXOC5", "SPIN1", "ADCY9", "SST", "HSDL2", "HSDL2")
-RidgePlot(seurat_obj, features = features, group.by = 'sample', ncol=3)
-```
-REMOVE
 
 For downstream analysis we are combing the samples back into a single layer.
 ```{r}
@@ -570,6 +554,9 @@ df3 <- df3[df3$is_diff == 1,]
 df3
 ```
 
+```{r}
+df_edgeR_ranks <- rbind(df1, df2, df3)
+```
 
 
 
