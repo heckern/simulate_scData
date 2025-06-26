@@ -1,0 +1,607 @@
+---
+title: "Simulation of single cell RNA-seq data for differential expression analysis"
+output:
+  html_document:
+    df_print: paged
+---
+
+In this notebook, we are simulating single cell RNA-seq data for the purpose of testing approaches for differential expression analysis. The following scenario is considered:
+
+* 2 control samples (female/male) and 2 disease samples (female/male)
+* only the male disease sample contains the 100 differentially expressed genes, which we are interested in
+  + this will create a more complex scenario for differential expression analysis
+* 2000 genes
+* 500 cells per sample
+* for simplicity, we assume that cells across samples follow similar gene expression patterns
+
+This setup could reflect data of a single cell type or single cell data obtained from ex vivo cell lines. Sex specific differences in gene expression could reflect the differences in prevalence or progression  for diseaseas such as Parkinson's. 
+
+The frameworks that are used for differential expression analysis are Seurat and edgeR.
+
+```{r}
+library(dplyr)
+library(Seurat)
+library(patchwork)
+library(ggplot2)
+library(edgeR)
+source('simulate_single_cell.R')
+```
+
+```{r}
+set.seed(42)
+```
+
+
+## Simulating a count matrix
+
+First, we load human gene names. These will be used in a randomized fashion.
+
+```{r}
+path_gene_names <- "brain_genes.txt"
+list_init_genes <- read.csv(path_gene_names, header=F)$V1
+```
+
+A count matrix is created based on a list of average expression values for each gene. The following code is used:
+```{r}
+getAnywhere(init_count_matrix)
+```
+
+This matrix will contain raw integer counts that are equal to or greater than zero. The expression of a gene is modeled as a negative binomial distribution over the cells of a sample. A negative binomial distribution reflects single cell gene expression well given that only fraction of the actual transcripts is detected by single cell sequencing. This leads to a distribution which is skewed towards zero. A helper function for generating negative binomial distributions:
+
+```{r}
+getAnywhere(get_neg_binomial)
+```
+
+### Parameters
+
+To obtain some variation between the expression of genes, we model their average expression as a normal distribution. This could also be substituted by any distribution of choice.
+```{r}
+# parameters
+n_samples <- 500
+mean_expr <- 10
+sd_expr <- 2
+sd_noise <- 0.1 # up to 10% of noise will be added to mean expression values of the samples 
+
+n_diff_genes = 100
+diff_mean_expr <- 50 # for differentially expressed genes, we use higher mean expression and variance
+diff_sd_expr <- 3
+
+# to reduce the amount of resources, 2000 gene names are picked randomly
+n_selected_genes <- 2000
+list_genes <- sample(list_init_genes, n_selected_genes, replace=FALSE) 
+n_genes <- length(list_genes)
+
+# pseudobulks will be used for edgeR analysis
+n_pseudobulks <- 5
+
+# intial mean expression of the genes
+expression_mu <- rnorm(length(list_genes), mean=mean_expr, sd=sd_expr)
+```
+
+The expression of genes is modeled seperately for each sample but based on the same mean expression values. To add variation between the samples, up to 10% of noise is added to the mean expression of each gene.
+
+### Create a count matrix for female control data
+
+```{r}
+tag <- 'ctrl_f_'
+
+noise <- rnorm(n_genes, mean=0, sd=sd_noise)
+expression_mu_tmp <- expression_mu + expression_mu * noise
+counts_ctrl_f <- init_count_matrix(n_samples, cell_tag=tag, list_genes=list_genes, 
+                                   list_mu_expression=expression_mu_tmp)
+```
+
+### Create a count matrix for female disease data
+
+The female disease data will not show characteristic differentially expressed genes to increase the complexity of the data.
+```{r}
+tag <- 'pat_f_'
+
+noise <- rnorm(n_genes, mean=0, sd=sd_noise)
+expression_mu_tmp <- expression_mu + expression_mu * noise
+
+counts_pat_f <- init_count_matrix(n_samples, cell_tag=tag, list_genes=list_genes, 
+                                   list_mu_expression=expression_mu_tmp)
+```
+
+
+### Create a count matrix for male control data
+```{r}
+tag <- 'ctrl_m_'
+
+noise <- rnorm(n_genes, mean=0, sd=sd_noise)
+expression_mu_tmp <- expression_mu + expression_mu * noise
+
+counts_ctrl_m <- init_count_matrix(n_samples, cell_tag=tag, list_genes=list_genes, 
+                                   list_mu_expression=expression_mu_tmp)
+```
+
+
+### Creating a count matrix for male disease data
+For the male disease sample, we pick 100 genes at random and model their expression based on a higher mean expression and variance
+```{r}
+# change distribution for selected genes
+tag <- 'pat_m_'
+
+noise <- rnorm(n_genes, mean=0, sd=sd_noise)
+expression_mu_tmp <- expression_mu + expression_mu * noise
+
+idx_diff_genes <- sample(seq(1:n_genes), n_diff_genes, replace=FALSE)
+
+expression_mu_tmp[idx_diff_genes] <- rnorm(n_diff_genes, mean=diff_mean_expr, sd=diff_sd_expr)
+
+counts_pat_m <- init_count_matrix(n_samples, cell_tag=tag, list_genes=list_genes, 
+                                   list_mu_expression=expression_mu_tmp)
+```
+
+
+The count matrices of the four samples is merged into a single count matrix.
+```{r}
+list_counts <- list(counts_ctrl_f, counts_pat_f, counts_ctrl_m, counts_pat_m)
+counts <- do.call(cbind, list_counts)
+dim(counts)
+```
+
+
+### Meta data
+AS meta date we assign a sample identifier, the sex, and whether it is a control or disease sample.
+```{r}
+sample <- rep("sample-1", n_samples)
+sample <- c(sample, rep("sample-2", n_samples) )
+sample <- c(sample, rep("sample-3", n_samples) )
+sample <- c(sample, rep("sample-4", n_samples) )
+
+
+sex <- rep("female", n_samples)
+sex <- c(sex, rep("female", n_samples) )
+sex <- c(sex, rep("male", n_samples) )
+sex <- c(sex, rep("male", n_samples) )
+
+pathology <- rep("control", n_samples)
+pathology <- c(pathology, rep("disease", n_samples))
+pathology <- c(pathology, rep("control", n_samples))
+pathology <- c(pathology, rep("disease", n_samples))
+```
+
+
+edgeR analysis is performed on pseudobulks. To improve the robustness of the inference, we will be creating 5 pseudobulks per sample. We already at this information to the meta data at this stage.
+```{r}
+# pseudobulk entries
+n_samp_per_pseudo <- n_samples / n_pseudobulks
+
+
+pseudobulk <- c()
+tag <- "pblk"
+for(sid in c("sample-1", "sample-2", "sample-3", "sample-4")) {
+  
+  temp_pseudobulks <- c()
+  for(i in 1:n_pseudobulks) {
+    temp_pseudobulks <- c(temp_pseudobulks, rep(paste(tag, as.character(i), 
+                                                      sep="-"), n_samp_per_pseudo))
+  }
+  pseudobulk <- c(pseudobulk, sample(temp_pseudobulks, length(temp_pseudobulks), 
+                                     replace=FALSE))
+}
+```
+
+Meta data entries are simply compiled in a data frame.
+```{r}
+df_meta <- data.frame(sample, sex, pathology, pseudobulk)
+rownames(df_meta) <- colnames(counts)
+df_meta
+```
+
+
+## Seurat analysis
+
+Seurat will be used to investigate the structure of our data ....
+
+
+First, we create a Seurat object from the count data.
+```{r}
+# create Seurat object
+seurat_obj <- CreateSeuratObject(counts = counts, project = "simulated_data", min.cells = 3, min.features = 200)
+seurat_obj
+```
+
+Second, we add meta data.
+```{r}
+seurat_obj <- AddMetaData(object=seurat_obj, metadata=df_meta)
+```
+
+Third, we split the samples into different layers. This will allows as to integrate samples downstream.
+```{r}
+seurat_obj[["RNA"]] <- split(seurat_obj[["RNA"]], f = seurat_obj$sample)
+seurat_obj
+```
+
+
+Counts per cells are log-normalized.
+```{r}
+seurat_obj <- NormalizeData(seurat_obj, normalization.method = "LogNormalize", scale.factor = 10000)
+```
+
+First, we will identify variable genes.
+```{r}
+seurat_obj <- FindVariableFeatures(seurat_obj, selection.method = "vst", nfeatures = 200)
+
+# Identify the 10 most highly variable genes
+top10 <- head(VariableFeatures(seurat_obj), 10)
+
+# plot variable features with and without labels
+plot <- LabelPoints(plot = plot1, points = top10, repel = TRUE)
+plot
+```
+
+### Dimensionality reduction
+
+To get a better understanding of our data, we perform a dimensional reduction using PCA and compute an embedding of the cells, a UMAP.
+```{r}
+all.genes <- rownames(seurat_obj)
+seurat_obj <- ScaleData(seurat_obj, features = all.genes)
+```
+
+```{r}
+seurat_obj <- RunPCA(seurat_obj, features = VariableFeatures(object = seurat_obj))
+```
+
+```{r}
+VizDimLoadings(seurat_obj, dims = 1:2, reduction = "pca")
+```
+
+
+```{r}
+DimPlot(seurat_obj, reduction = "pca", group.by='sex')
+```
+
+```{r}
+DimPlot(seurat_obj, reduction = "pca", group.by='pathology')
+```
+We can already distinguish the male disease sample in the PCA based on the variance of gene expression, most likely due to the differentially expressed genes. 
+
+
+```{r}
+ElbowPlot(seurat_obj)
+```
+
+```{r}
+seurat_obj <- FindNeighbors(seurat_obj, dims = 1:5)
+seurat_obj <- FindClusters(seurat_obj, resolution = 0.5)
+```
+
+
+```{r}
+seurat_obj <- RunUMAP(seurat_obj, dims = 1:5)
+```
+
+
+```{r}
+DimPlot(seurat_obj, reduction = "umap", group.by = c('sample'))
+```
+```{r}
+seurat_obj <- IntegrateLayers(
+  object = seurat_obj, method = CCAIntegration,
+  orig.reduction = "pca", new.reduction = "integrated.cca",
+  verbose = FALSE
+)
+```
+Similarly to the PCA, the UMAP shows that the male diseae sample exhibits differences to the other three samples.
+
+
+### Sample integration
+
+To verify that our simulated samples not too distinct from one another, we are integrating the samples using canonical correlation analysis (CCA). This will show us whether the samples follow overall a similar distribution of gene expression after considering sample batch effects.
+```{r}
+seurat_obj <- FindNeighbors(seurat_obj, reduction = "integrated.cca", dims = 1:5)
+seurat_obj <- FindClusters(seurat_obj, resolution = 2, cluster.name = "cca_clusters")
+```
+
+```{r}
+obj <- RunUMAP(seurat_obj, reduction = "integrated.cca", dims = 1:5, reduction.name = "umap.cca")
+DimPlot(
+  obj,
+  reduction = "umap.cca",
+  group.by = c("sample", "sex", "pathology"),
+  combine = FALSE, label.size = 2
+)
+
+```
+
+We can indeed observe that all samples integrate well despite the differential expression of the 100 genes. This is usually the case for data that was obtained from different samples but similar cell types.
+
+
+
+REMOVE
+```{r}
+list_genes[idx_diff_genes]
+```
+
+```{r}
+list_genes[-idx_diff_genes][0:10]
+```
+REMOVE
+
+
+```{r}
+features <- c("EXOC5", "SPIN1", "ADCY9", "SST", "HSDL2", "HSDL2")
+RidgePlot(seurat_obj, features = features, group.by = 'sample', ncol=3)
+```
+REMOVE
+
+For downstream analysis we are combing the samples back into a single layer.
+```{r}
+seurat_obj <- JoinLayers(seurat_obj)
+```
+
+
+### Differntial expression analysis using Wilcoxon signed-rank tests
+
+As single cell RNA-seq data does not typically follow a normal distribution, non-parameteric tests, which have less requirements, are a preferred method for differential expression analysis. Here we are using Wilcoxon signed-rank tests, which are a default method for single cell analysis frameworks like Seurat and SCANPY. Per default P-value are adjusted by a Bonferroni correction for multiple testing.
+
+We first compare the control against disease condition.
+```{r}
+Idents(seurat_obj) <- 'pathology'
+pathology.de.markers <- FindMarkers(seurat_obj, ident.1 = "disease", ident.2 = "control", test.use = "wilcox", logfc.threshold = 0)
+dim(pathology.de.markers)
+```
+
+```{r}
+ pathology.de.markers[ order(pathology.de.markers$avg_log2FC, decreasing=TRUE),]
+```
+
+
+
+To assess how well the Wilcoxon test is detecting the differentially expressed genes, rank the genes by adjusted p-value. This will be compared downstream for the 100 genes that we simulated to be differentially expressed.
+```{r}
+is_diff <- numeric(dim(pathology.de.markers)[1])
+is_diff[idx_diff_genes] <- 1
+names(is_diff) <- list_genes
+
+pathology.de.markers$is_diff <- is_diff[rownames(pathology.de.markers)]
+pathology.de.markers
+
+ranked <- rank(pathology.de.markers$p_val_adj, ties='first')
+
+df1 <- data.frame( rank=ranked )
+df1$contrast <- "Wilcox - pathology"
+df1$is_diff <- pathology.de.markers$is_diff
+df1 <- df1[df1$is_diff == 1,]
+df1
+```
+
+
+Next, we identify genes that are differentially expressed between the male disease sample (*sample-4*).
+```{r}
+Idents(seurat_obj) <- 'sample'
+sample4.de.markers <- FindMarkers(seurat_obj, ident.1 = "sample-4", ident.2 = NULL, test.use = "wilcox", logfc.threshold = 0)
+dim(sample4.de.markers)
+```
+
+
+```{r}
+ sample4.de.markers[ order(sample4.de.markers$avg_log2FC, decreasing=TRUE),]
+```
+
+
+```{r}
+sample4.de.markers$is_diff <- is_diff[rownames(sample4.de.markers)]
+sample4.de.markers
+
+ranked <- rank(sample4.de.markers$p_val_adj, ties='first')
+
+df2 <- data.frame( rank=ranked )
+df2$contrast <- "Wilcox - sample"
+df2$is_diff <- sample4.de.markers$is_diff
+df2 <- df2[df2$is_diff == 1,]
+df2
+```
+
+We combine the ranks for both contrasts (*pathology* and *sample*) in a data frame.
+```{r}
+df_wilcox_ranks <- rbind(df1, df2)
+```
+
+
+Examples of differentially expressed genes
+```{r}
+features <- c("UGCG", "RASA3", "HUNK", "EIF2AK2", "POLR3G", "SCML1")
+RidgePlot(seurat_obj, features = features, group.by = 'sample', ncol=3)
+```
+
+
+
+
+### edgeR differentially expression analysis
+
+edgeR was initially developed for bulk RNA-seq. To apply the framework to single cell data, we have to aggregate the cells into pseudobulks. Here we create 5 pseudobulks per sample that consists of each 100 cells.
+```{r}
+pseudo_seurat_obj <- AggregateExpression(seurat_obj, assays = 'RNA', return.seurat = T, 
+                                         group.by = c('sample', 'sex', 'pathology', 'pseudobulk'))
+
+dim(pseudo_seurat_obj)
+```
+This results in overall 20 pseudobulks.
+
+
+Examples of differentially expressed genes after creating pseudobulks
+```{r}
+features <- c("UGCG", "RASA3", "HUNK", "EIF2AK2", "POLR3G", "SCML1")
+RidgePlot(pseudo_seurat_obj, features = features, group.by = 'sample', ncol=3)
+```
+
+
+
+First we create an edgeR object from the pseudobulk counts and normalize the reads.
+```{r}
+pblk_counts <- pseudo_seurat_obj@assays$RNA$counts
+df_pblk_meta <- pseudo_seurat_obj@meta.data
+
+y <- DGEList(pblk_counts, group = df_pblk_meta$pathology)
+y <- normLibSizes(y)
+```
+
+
+EdgeR fits a generalized linear model (GLM) that allows us to explicitly model different properties of the data. edgeR is a very suitable for sequencing data as it uses a negative binomial model fitting the assumptions about the underlying distribution of gene expression. As a first step, we define a design matrix that allows us to take multiple factors into account such as the pathology state or associated sex of a sample.
+```{r}
+pathology <- df_pblk_meta$pathology
+sex <- df_pblk_meta$sex
+sample <- gsub("-", "_", df_pblk_meta$sample)
+
+design <- model.matrix(~ pathology + sex)
+```
+
+
+```{r}
+design
+```
+
+This design matrix is used for fitting the model.
+```{r}
+y <- estimateDisp(y, design)
+fit <- glmQLFit(y, design)
+```
+
+Based on the expression differences, we see that pseudobulks but not samples cluster closely together.
+```{r}
+plotMDS(y, col=ifelse(y$samples$group == "disease", "red", "blue"))
+```
+
+By plotting the variation of gene expression against their expression amplitude, we can see the differentially expressed genes (top right).
+```{r}
+plotBCV(y)
+```
+
+
+An advantage of generalized linear models, is that we can consider more complex contrast such as differences based on pathology and sex.
+```{r}
+myContrast <- makeContrasts('sexmale+pathologydisease', levels = design)
+qlf <- glmQLFTest(fit, contrast=myContrast)
+
+res <- topTags(qlf, n = Inf, adjust.method="bonferroni")
+res <- res$table
+res$is_diff <- is_diff[rownames(res)]
+```
+
+
+```{r}
+res
+```
+
+```{r}
+ranked <- rank(res$FWER, ties='first')
+
+df1 <- data.frame( rank=ranked )
+df1$contrast <- "edgeR - pathology + sex"
+df1$is_diff <- res$is_diff
+df1 <- df1[df1$is_diff == 1,]
+```
+
+
+We will compare the combined contrast above to a contrast only using pathology.
+```{r}
+myContrast <- makeContrasts('pathologydisease', levels = design)
+qlf <- glmQLFTest(fit, contrast=myContrast)
+
+res <- topTags(qlf, n = Inf, adjust.method="bonferroni")
+res <- res$table
+res$is_diff <- is_diff[rownames(res)]
+```
+
+```{r}
+ranked <- rank(res$FWER, ties='first')
+
+df2 <- data.frame( rank=ranked )
+df2$contrast <- "edgeR - pathology"
+df2$is_diff <- res$is_diff
+df2 <- df2[df2$is_diff == 1,]
+```
+
+
+As a comparison we will also compute a contrast for the male disease samples against the other samples directly.
+```{r}
+pblk_counts <- pseudo_seurat_obj@assays$RNA$counts
+df_pblk_meta <- pseudo_seurat_obj@meta.data
+
+y <- DGEList(pblk_counts, group = df_pblk_meta$pathology)
+y <- normLibSizes(y)
+```
+
+
+```{r}
+pathology <- df_pblk_meta$pathology
+sex <- df_pblk_meta$sex
+sample <- gsub("-", "_", df_pblk_meta$sample)
+
+design <- model.matrix(~ sample)
+design
+```
+
+```{r}
+y <- estimateDisp(y, design)
+fit <- glmQLFit(y, design)
+```
+
+
+
+
+```{r}
+myContrast <- makeContrasts('samplesample_4'
+                            , levels = design)
+qlf <- glmQLFTest(fit, contrast=myContrast)
+
+res <- topTags(qlf, n = Inf, adjust.method="bonferroni")
+res <- res$table
+res$is_diff <- is_diff[rownames(res)]
+```
+
+
+```{r}
+res
+```
+
+
+```{r}
+ranked <- rank(res$FWER, ties='first')
+
+df3 <- data.frame( rank=ranked )
+df3$contrast <- "edgeR - sample"
+df3$is_diff <- res$is_diff
+df3 <- df3[df3$is_diff == 1,]
+df3
+```
+
+
+
+
+
+
+```{r}
+library(ggplot2)
+# Basic violin plot
+
+df_ranks <- rbind(df_edgeR_ranks, df_wilcox_ranks)
+
+p <- ggplot(df_ranks, aes(x=contrast, y=rank, fill=contrast)) + 
+  geom_violin(trim=FALSE) +
+  geom_dotplot(binaxis='y', stackdir='center', dotsize=0.01) +
+  geom_jitter(shape=16, position=position_jitter(0.2))
+p
+```
+The 100 differentially expressed genes have a perfect recall (see below), i.e. the top 100 genes are the genes of interest,  when sample-specific contrasts are performed with either edgeR or Wilcoxon tests. As one might expect, based on *pathology* alone edgeR does not rank the 100 genes well. This improves substantially when both *pathology* and *sex* is taking into account. Wilcoxon tests perform suprisingly well on *patholohy* alone. However, this might also indicate a weakness of the single cell Wilcoxon test as it suggests that half of the cells (from the female disease sample) have little impact on the inference. So, it might pick up effects specific to a sample that are not characteristic for other samples in the same group.
+
+
+
+
+```{r}
+contrasts <- unique(df_ranks$contrast)
+max_rank <- c()
+for(con in c(contrasts)) {
+  max_rank <- c(max_rank, max(df_ranks[ df_ranks$contrast == con,]$rank))
+}
+df_max_rank <- data.frame(contrast=contrasts, max_rank)
+df_max_rank
+```
+
+
+
+
